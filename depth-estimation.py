@@ -1,112 +1,140 @@
 import cv2
-import numpy as np
 import torch
-from PIL import Image
-import matplotlib.pyplot as plt
-from transformers import pipeline
+import numpy as np
 import time
+import matplotlib.pyplot as plt
+from torchvision.transforms import Compose, Resize, ToTensor, Normalize
 
-def process_video_depth(video_path, output_path):
-    """
-    使用DepthFM处理视频并输出中心点深度变化曲线
-    
-    Args:
-        video_path: 输入视频路径
-        output_path: 输出视频路径
-    """
-    # 初始化DepthFM深度估计模型
-    depth_estimator = pipeline('depth-estimation', model='LiheYoung/depth-fm-large')
-    
-    # 打开视频文件
+def load_model(model_type):
+    """加载本地MiDaS模型"""
+    model = torch.hub.load("intel-isl/MiDaS", model_type)
+    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    model.to(device)
+    model.eval()
+    transform = torch.hub.load("intel-isl/MiDaS", "transforms").small_transform
+    return model, transform, device
+
+def normalize_depth_map(depth_map):
+    """将深度图归一化到0-255范围，便于可视化"""
+    depth_min = depth_map.min()
+    depth_max = depth_map.max()
+    normalized_depth = 255 * (depth_map - depth_min) / (depth_max - depth_min)
+    return normalized_depth.astype(np.uint8)
+
+def create_heatmap(depth_map):
+    """将深度图转换为彩色热力图"""
+    normalized_depth = normalize_depth_map(depth_map)
+    heatmap = cv2.applyColorMap(normalized_depth, cv2.COLORMAP_INFERNO)
+    return heatmap
+
+def process_video(video_path, model, transform, device):
+    """处理视频并实时显示结果"""
     cap = cv2.VideoCapture(video_path)
+    fps = cap.get(cv2.CAP_PROP_FPS)
+    frame_time = 1/fps if fps > 0 else 1/30  # 计算每帧应该的展示时间
     
-    # 获取视频参数
-    fps = int(cap.get(cv2.CAP_PROP_FPS))
-    frame_width = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH))
-    frame_height = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
+    # 创建窗口
+    cv2.namedWindow('Depth Visualization', cv2.WINDOW_NORMAL)
     
-    # 创建视频写入器
-    fourcc = cv2.VideoWriter_fourcc(*'mp4v')
-    out = cv2.VideoWriter(output_path, fourcc, fps, (frame_width, frame_height))
-    
-    # 存储中心点深度值
     center_depths = []
-    frame_times = []
+    timestamps = []
     frame_count = 0
     
     while cap.isOpened():
+        start_time = time.time()  # 记录开始处理时间
+        
         ret, frame = cap.read()
         if not ret:
             break
             
-        # 转换为RGB格式
-        frame_rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
-        image = Image.fromarray(frame_rgb)
+        # 准备输入
+        input_batch = transform(frame).to(device)
         
-        # 深度估计
-        depth_map = depth_estimator(image)['depth']
+        # 预测深度
+        with torch.no_grad():
+            prediction = model(input_batch)
+            prediction = torch.nn.functional.interpolate(
+                prediction.unsqueeze(1),
+                size=frame.shape[:2],
+                mode="bicubic",
+                align_corners=False,
+            ).squeeze()
         
-        # 获取深度图
-        depth_np = np.array(depth_map)
+        depth_map = prediction.cpu().numpy()
         
         # 获取中心点深度值
-        center_y = frame_height // 2
-        center_x = frame_width // 2
-        center_depth = depth_np[center_y, center_x]
-        
-        # 记录深度值和时间
+        h, w = depth_map.shape
+        center_depth = depth_map[h//2, w//2]
         center_depths.append(center_depth)
-        frame_times.append(frame_count / fps)
+        timestamps.append(frame_count / fps)
         
-        # 可视化深度图
-        depth_colored = cv2.applyColorMap(
-            cv2.convertScaleAbs(depth_np, alpha=50), 
-            cv2.COLORMAP_JET
-        )
+        # 创建热力图
+        heatmap = create_heatmap(depth_map)
         
-        # 在深度图上标记中心点
-        cv2.circle(depth_colored, (center_x, center_y), 5, (0, 0, 255), -1)
+        # 创建显示图像
+        # 调整frame和heatmap大小使其相同
+        frame = cv2.resize(frame, (640, 480))
+        heatmap = cv2.resize(heatmap, (640, 480))
         
-        # 写入输出视频
-        out.write(depth_colored)
+        # 水平拼接原图和热力图
+        combined_img = np.hstack((frame, heatmap))
+        
+        # 添加黑色底部区域显示深度值
+        bottom_height = 50
+        bottom = np.zeros((bottom_height, combined_img.shape[1], 3), dtype=np.uint8)
+        
+        # 在底部添加文字
+        text = f'Center Depth: {center_depth:.2f}'
+        cv2.putText(bottom, text, (20, 30), cv2.FONT_HERSHEY_SIMPLEX, 
+                    1, (255, 255, 255), 2)
+        
+        # 垂直拼接
+        final_img = np.vstack((combined_img, bottom))
+        
+        # 显示结果
+        cv2.imshow('Depth Visualization', final_img)
+        
+        # 计算需要等待的时间以匹配原视频帧率
+        process_time = time.time() - start_time
+        wait_time = max(1, int((frame_time - process_time) * 1000))
+        
+        # 检查是否按下'q'键退出
+        if cv2.waitKey(wait_time) & 0xFF == ord('q'):
+            break
         
         frame_count += 1
         
-    # 释放资源
+        if frame_count % 30 == 0:
+            print(f"Processed {frame_count} frames")
+    
     cap.release()
-    out.release()
-    
-    # 绘制深度变化曲线
-    plt.figure(figsize=(12, 6))
-    plt.plot(frame_times, center_depths)
-    plt.title('Center Point Depth Over Time')
-    plt.xlabel('Time (seconds)')
-    plt.ylabel('Depth')
-    plt.grid(True)
-    plt.savefig('depth_curve.png')
-    plt.close()
-    
-    return frame_times, center_depths
+    cv2.destroyAllWindows()
+    return timestamps, center_depths
 
-def visualize_results(frame_times, center_depths):
-    """
-    创建交互式深度变化曲线图
-    """
+def plot_depth_curve(timestamps, depths):
+    """绘制深度随时间变化的曲线"""
     plt.figure(figsize=(12, 6))
-    plt.plot(frame_times, center_depths, 'b-')
-    plt.title('Depth Variation at Video Center')
+    plt.plot(timestamps, depths)
     plt.xlabel('Time (seconds)')
-    plt.ylabel('Estimated Depth (meters)')
+    plt.ylabel('Relative Depth')
+    plt.title('Center Depth vs Time')
     plt.grid(True)
     plt.show()
 
-# 使用示例
+def main(video_path, model_type):
+    """主函数"""
+    print("Loading model...")
+    model, transform, device = load_model(model_type)
+    
+    print("Processing video...")
+    timestamps, depths = process_video(video_path, model, transform, device)
+    
+    print("Plotting results...")
+    plot_depth_curve(timestamps, depths)
+    
+    return timestamps, depths
+
 if __name__ == "__main__":
-    video_path = "input_video.mp4"
-    output_path = "output_depth.mp4"
-    
-    # 处理视频并获取数据
-    times, depths = process_video_depth(video_path, output_path)
-    
-    # 显示结果
-    visualize_results(times, depths)
+    video_path = 'D:/ShimitsuKoi/LDAR_MDE/videos/N01091919.mp4'
+    model_type = 'DPT_BEiT_B_384'
+    main(video_path, model_type)
